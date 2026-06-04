@@ -1,0 +1,510 @@
+// OMG ERP — Prisma schema
+// Database: PostgreSQL 16
+// Money columns: Decimal(18, 2) — MYR with 2 decimal places
+// All timestamps stored in UTC, rendered in Asia/Kuala_Lumpur via lib/format.ts
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// AUTH & USERS
+// ============================================================
+
+enum Role {
+  ADMIN
+  CUSTOMER
+  DELIVERY
+}
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         Role
+  active       Boolean  @default(true)
+  phone        String?
+
+  // For role=CUSTOMER, link to the Customer (service centre) account
+  customerId   String?
+  customer     Customer? @relation(fields: [customerId], references: [id])
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Reverse relations
+  createdSalesOrders   SalesOrder[]    @relation("SOCreatedBy")
+  pickedDeliveries     Delivery[]      @relation("DeliveryPickedBy")
+  recordedPayments     Payment[]       @relation("PaymentRecordedBy")
+  stockMovements       StockMovement[] @relation("StockMovementBy")
+
+  @@index([role])
+}
+
+// ============================================================
+// SETTINGS (singleton)
+// ============================================================
+
+model Settings {
+  id                Int      @id @default(1)
+  companyName       String   @default("OMG")
+  companyAddress    String?
+  companyPhone      String?
+  companyEmail      String?
+  sstRegistered     Boolean  @default(false)
+  defaultSstRate    Decimal  @default(0) @db.Decimal(5, 2) // percentage e.g. 5.00 or 10.00
+  invoicePrefix     String   @default("OMG-INV-")
+  invoiceCounterYr  Int      @default(2026)
+  invoiceCounterSeq Int      @default(0)
+  defaultPaymentTermsDays Int @default(30)
+
+  updatedAt DateTime @updatedAt
+}
+
+// ============================================================
+// SUPPLIERS
+// ============================================================
+
+model Supplier {
+  id              String  @id @default(cuid())
+  code            String  @unique // human-readable e.g. SUP-0001
+  name            String
+  contactName     String?
+  email           String?
+  phone           String?
+  address         String?
+  paymentTermsDays Int    @default(30) // days we have to pay supplier
+  active          Boolean @default(true)
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  parts         Part[]            @relation("PartPrimarySupplier")
+  purchaseOrders PurchaseOrder[]
+
+  @@index([active])
+}
+
+// ============================================================
+// CUSTOMERS (service centres)
+// ============================================================
+
+model Customer {
+  id              String  @id @default(cuid())
+  code            String  @unique // CUST-0001
+  name            String  // Service centre name
+  contactName     String?
+  email           String?
+  phone           String?
+  address         String?
+  paymentTermsDays Int    @default(30) // NET 30 default
+  creditLimit     Decimal @default(0) @db.Decimal(18, 2)
+  active          Boolean @default(true)
+  notes           String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users        User[]
+  salesOrders  SalesOrder[]
+  invoices     Invoice[]
+  payments     Payment[]
+
+  @@index([active])
+}
+
+// ============================================================
+// PARTS / INVENTORY
+// ============================================================
+
+model PartCategory {
+  id    String @id @default(cuid())
+  name  String @unique
+  parts Part[]
+}
+
+model Brand {
+  id    String @id @default(cuid())
+  name  String @unique
+  parts Part[]
+}
+
+model Location {
+  id        String      @id @default(cuid())
+  code      String      @unique // e.g. MAIN, BIN-A1
+  name      String
+  isDefault Boolean     @default(false)
+  inventory Inventory[]
+}
+
+model Part {
+  id          String  @id @default(cuid())
+  sku         String  @unique // internal SKU
+  partNumber  String  // primary part number
+  name        String
+  description String?
+  barcode     String?
+
+  categoryId  String?
+  category    PartCategory? @relation(fields: [categoryId], references: [id])
+
+  brandId     String?
+  brand       Brand? @relation(fields: [brandId], references: [id])
+
+  primarySupplierId String?
+  primarySupplier   Supplier? @relation("PartPrimarySupplier", fields: [primarySupplierId], references: [id])
+
+  // Pricing (MYR)
+  costPrice   Decimal @default(0) @db.Decimal(18, 2)
+  sellPrice   Decimal @default(0) @db.Decimal(18, 2)
+
+  // Stock policy
+  minStock    Int     @default(0) // alert threshold
+  reorderQty  Int     @default(0) // suggested order quantity
+  leadTimeDays Int    @default(7) // typical supplier lead time
+
+  // Tax
+  sstRate     Decimal? @db.Decimal(5, 2) // null = use Settings.defaultSstRate
+
+  active      Boolean @default(true)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  inventory          Inventory[]
+  crossReferences    PartCrossReference[]
+  stockMovements     StockMovement[]
+  salesOrderItems    SalesOrderItem[]
+  purchaseOrderItems PurchaseOrderItem[]
+  invoiceItems       InvoiceItem[]
+
+  @@index([partNumber])
+  @@index([active])
+  @@index([categoryId])
+  @@index([brandId])
+}
+
+model PartCrossReference {
+  id           String @id @default(cuid())
+  partId       String
+  part         Part   @relation(fields: [partId], references: [id], onDelete: Cascade)
+  partNumber   String // alternate / OEM number
+  manufacturer String?
+
+  @@unique([partId, partNumber])
+  @@index([partNumber])
+}
+
+// Snapshot of stock-on-hand per part per location (denormalised for fast reads)
+model Inventory {
+  id           String   @id @default(cuid())
+  partId       String
+  part         Part     @relation(fields: [partId], references: [id], onDelete: Cascade)
+  locationId   String
+  location     Location @relation(fields: [locationId], references: [id])
+  quantity     Int      @default(0) // available
+  reserved     Int      @default(0) // committed to confirmed orders not yet shipped
+  updatedAt    DateTime @updatedAt
+
+  @@unique([partId, locationId])
+  @@index([partId])
+}
+
+enum StockMovementType {
+  RECEIPT       // PO received — stock in
+  SHIPMENT      // SO shipped — stock out
+  ADJUSTMENT    // manual stock-take correction
+  RESERVE       // reserved for confirmed order
+  RELEASE       // reservation released (cancellation)
+  TRANSFER_IN
+  TRANSFER_OUT
+}
+
+model StockMovement {
+  id          String            @id @default(cuid())
+  partId      String
+  part        Part              @relation(fields: [partId], references: [id])
+  locationId  String?
+  type        StockMovementType
+  quantity    Int               // signed: positive in, negative out
+  refType     String?           // 'PURCHASE_ORDER' | 'SALES_ORDER' | 'ADJUSTMENT'
+  refId       String?           // FK to that record
+  notes       String?
+  byUserId    String?
+  byUser      User?             @relation("StockMovementBy", fields: [byUserId], references: [id])
+  createdAt   DateTime          @default(now())
+
+  @@index([partId, createdAt])
+  @@index([type])
+}
+
+// ============================================================
+// PURCHASE ORDERS (to suppliers)
+// ============================================================
+
+enum PurchaseOrderStatus {
+  DRAFT
+  SENT
+  PARTIAL
+  RECEIVED
+  CANCELLED
+}
+
+model PurchaseOrder {
+  id          String              @id @default(cuid())
+  number      String              @unique // e.g. OMG-PO-2026-00001
+  supplierId  String
+  supplier    Supplier            @relation(fields: [supplierId], references: [id])
+  status      PurchaseOrderStatus @default(DRAFT)
+  orderDate   DateTime            @default(now())
+  expectedAt  DateTime?
+  receivedAt  DateTime?
+  notes       String?
+
+  subtotal    Decimal @default(0) @db.Decimal(18, 2)
+  taxTotal    Decimal @default(0) @db.Decimal(18, 2)
+  total       Decimal @default(0) @db.Decimal(18, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items PurchaseOrderItem[]
+
+  @@index([status])
+  @@index([supplierId])
+}
+
+model PurchaseOrderItem {
+  id              String        @id @default(cuid())
+  purchaseOrderId String
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  partId          String
+  part            Part          @relation(fields: [partId], references: [id])
+  quantity        Int
+  receivedQty     Int           @default(0)
+  unitCost        Decimal       @db.Decimal(18, 2)
+  lineTotal       Decimal       @db.Decimal(18, 2)
+
+  @@index([purchaseOrderId])
+}
+
+// ============================================================
+// SALES ORDERS (from customers)
+// ============================================================
+
+enum SalesOrderStatus {
+  PENDING       // customer placed, awaiting admin confirmation
+  CONFIRMED     // admin confirmed; stock reserved; invoice generated
+  PICKING       // delivery team picking
+  DISPATCHED    // out for delivery
+  DELIVERED
+  CANCELLED
+}
+
+model SalesOrder {
+  id          String           @id @default(cuid())
+  number      String           @unique // OMG-SO-2026-00001
+  customerId  String
+  customer    Customer         @relation(fields: [customerId], references: [id])
+  createdById String?
+  createdBy   User?            @relation("SOCreatedBy", fields: [createdById], references: [id])
+  status      SalesOrderStatus @default(PENDING)
+  orderDate   DateTime         @default(now())
+  notes       String?
+  deliveryAddress String?
+
+  subtotal    Decimal @default(0) @db.Decimal(18, 2)
+  taxTotal    Decimal @default(0) @db.Decimal(18, 2)
+  total       Decimal @default(0) @db.Decimal(18, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items     SalesOrderItem[]
+  invoice   Invoice?
+  delivery  Delivery?
+
+  @@index([status])
+  @@index([customerId])
+  @@index([orderDate])
+}
+
+model SalesOrderItem {
+  id           String     @id @default(cuid())
+  salesOrderId String
+  salesOrder   SalesOrder @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  partId       String
+  part         Part       @relation(fields: [partId], references: [id])
+  quantity     Int
+  unitPrice    Decimal    @db.Decimal(18, 2)
+  unitCost     Decimal    @db.Decimal(18, 2) // snapshot of cost at sale time — for profit analytics
+  sstRate      Decimal    @default(0) @db.Decimal(5, 2)
+  lineTotal    Decimal    @db.Decimal(18, 2)
+
+  @@index([salesOrderId])
+  @@index([partId])
+}
+
+// ============================================================
+// INVOICING & PAYMENTS
+// ============================================================
+
+enum InvoiceStatus {
+  UNPAID
+  PARTIAL
+  PAID
+  OVERDUE     // unpaid past due date
+  VOID
+}
+
+model Invoice {
+  id           String        @id @default(cuid())
+  number       String        @unique // OMG-INV-2026-00001
+  customerId   String
+  customer     Customer      @relation(fields: [customerId], references: [id])
+  salesOrderId String?       @unique
+  salesOrder   SalesOrder?   @relation(fields: [salesOrderId], references: [id])
+  status       InvoiceStatus @default(UNPAID)
+  issueDate    DateTime      @default(now())
+  dueDate      DateTime
+  notes        String?
+
+  subtotal     Decimal @default(0) @db.Decimal(18, 2)
+  taxTotal     Decimal @default(0) @db.Decimal(18, 2)
+  total        Decimal @default(0) @db.Decimal(18, 2)
+  amountPaid   Decimal @default(0) @db.Decimal(18, 2)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  items    InvoiceItem[]
+  payments PaymentApplication[]
+
+  @@index([status])
+  @@index([customerId])
+  @@index([dueDate])
+}
+
+model InvoiceItem {
+  id          String  @id @default(cuid())
+  invoiceId   String
+  invoice     Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  partId      String?
+  part        Part?   @relation(fields: [partId], references: [id])
+  description String  // copied from part name at invoice time
+  quantity    Int
+  unitPrice   Decimal @db.Decimal(18, 2)
+  sstRate     Decimal @default(0) @db.Decimal(5, 2)
+  lineTotal   Decimal @db.Decimal(18, 2)
+
+  @@index([invoiceId])
+}
+
+enum PaymentMethod {
+  BANK_TRANSFER
+  CASH
+  CHEQUE
+  ONLINE
+  OTHER
+}
+
+model Payment {
+  id          String        @id @default(cuid())
+  reference   String        @unique // OMG-PMT-2026-00001
+  customerId  String
+  customer    Customer      @relation(fields: [customerId], references: [id])
+  amount      Decimal       @db.Decimal(18, 2)
+  method      PaymentMethod
+  receivedAt  DateTime      @default(now())
+  notes       String?       // bank ref, cheque number, etc.
+  recordedById String?
+  recordedBy  User?         @relation("PaymentRecordedBy", fields: [recordedById], references: [id])
+
+  createdAt DateTime @default(now())
+
+  applications PaymentApplication[]
+
+  @@index([customerId])
+  @@index([receivedAt])
+}
+
+// Allows a single payment to apply to one or many invoices
+model PaymentApplication {
+  id        String  @id @default(cuid())
+  paymentId String
+  payment   Payment @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  invoiceId String
+  invoice   Invoice @relation(fields: [invoiceId], references: [id])
+  amount    Decimal @db.Decimal(18, 2)
+
+  @@index([paymentId])
+  @@index([invoiceId])
+}
+
+// ============================================================
+// DELIVERY
+// ============================================================
+
+enum DeliveryStatus {
+  PENDING
+  PICKING
+  READY
+  DISPATCHED
+  DELIVERED
+  CANCELLED
+}
+
+// ============================================================
+// PUBLIC LEADS (contact requests from marketing site)
+// ============================================================
+
+enum ContactRequestStatus {
+  NEW
+  CONTACTED
+  CONVERTED
+  ARCHIVED
+}
+
+model ContactRequest {
+  id        String               @id @default(cuid())
+  name      String
+  company   String?
+  email     String
+  phone     String?
+  message   String?
+  source    String?              // e.g. "homepage", "footer"
+  status    ContactRequestStatus @default(NEW)
+  createdAt DateTime             @default(now())
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+model Delivery {
+  id           String         @id @default(cuid())
+  number       String         @unique // OMG-DEL-2026-00001
+  salesOrderId String         @unique
+  salesOrder   SalesOrder     @relation(fields: [salesOrderId], references: [id])
+  status       DeliveryStatus @default(PENDING)
+  pickedById   String?
+  pickedBy     User?          @relation("DeliveryPickedBy", fields: [pickedById], references: [id])
+  scheduledFor DateTime?
+  pickedAt     DateTime?
+  dispatchedAt DateTime?
+  deliveredAt  DateTime?
+  recipient    String?        // who signed for it
+  notes        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([scheduledFor])
+}

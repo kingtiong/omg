@@ -1,0 +1,37 @@
+# Environment variables (never commit secrets)
+.env
+.env.local
+.env.*.local
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+next-env.d.ts
+
+# Backups (original landing snapshot)
+.backup/
+
+# Build artifacts
+*.tsbuildinfo
+
+# Prisma
+prisma/migrations/dev.db*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings (contains machine-specific permissions/secrets)
+.claude/settings.local.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
